@@ -1,3 +1,3 @@
 # Dust-sensor-RP4
 
-Code for my bachelorproject
+Code for the Raspberry Pi 4 that was used during my bachelor's thesis
