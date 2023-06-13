@@ -1,116 +1,137 @@
+# s203970
+# Last updated 25/05/2023
+
 import time
 import board
 import busio
 import adafruit_ads1x15.ads1115 as ADS
-from adafruit_ads1x15.ads1x15 import Mode
 from adafruit_ads1x15.analog_in import AnalogIn
-import csv
+import numpy as np
+import RPi.GPIO as GPIO
+import math
 
 # Data collection setup
-RATE = 860
-SAMPLES = 8600
+RATE = 64
+DURATION = 200 # Chose a integration time
+CALIBRATION_DURATION = 10 # Chose a thresshold time
+THRESHOLD = 0.001 # Chose a thresshold
 
-# Create the I2C bus with a fast frequency
-i2c = busio.I2C(board.SCL, board.SDA, frequency=1000000)
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(18, GPIO.OUT)
 
-# Create the ADC object using the I2C bus
+i2c = busio.I2C(board.SCL, board.SDA)
+
+# Create the ADC objects using the I2C bus
 adsPD1 = ADS.ADS1115(i2c, address=0x4a)
 adsPD2 = ADS.ADS1115(i2c, address=0x4b)
 adsT = ADS.ADS1115(i2c, address=0x49)
 
-# Initialize gain-factor / Leg med disse tal
-adsPD1.gain = 4
-adsPD2.gain = 2
+# Initialize gain-factor
+adsPD1.gain = 1
+adsPD2.gain = 1
 adsT.gain = 4
 
-# Set up analog input channels
-chanPD1 = AnalogIn(adsPD1, ADS.P1)
-chanPD2 = AnalogIn(adsPD2, ADS.P1)
-chanT = AnalogIn(adsT, ADS.P0)
+# Set up channels
+chanPD1 = AnalogIn(adsPD1, ADS.P0, ADS.P1)
+chanPD2 = AnalogIn(adsPD2, ADS.P0, ADS.P1)
+chanT = AnalogIn(adsT, ADS.P0, ADS.P1)
 
 # ADC Configuration
-adsPD1.mode = Mode.CONTINUOUS
+adsPD1.mode = ADS.Mode.SINGLE
 adsPD1.data_rate = RATE
-adsPD2.mode = Mode.CONTINUOUS
+adsPD2.mode = ADS.Mode.SINGLE
 adsPD2.data_rate = RATE
-adsT.mode = Mode.CONTINUOUS
+adsT.mode = ADS.Mode.SINGLE
 adsT.data_rate = RATE
 
-# First ADC channel read in continuous mode configures device and waits 2 conversion cycles
-_ = chanPD1.value
-_ = chanPD2.value
-_ = chanT.value
+sample_interval = 1.0 / RATE
+total_samples = int(DURATION * RATE)
 
-sample_intervalPD1 = 1.0 / adsPD1.data_rate
-sample_intervalPD2 = 1.0 / adsPD2.data_rate
-sample_intervalT = 1.0 / adsT.data_rate
+voltPD1_on = []
+voltPD1_off = []
 
-repeats = 0
-skips = 0
+voltPD2_on= []
+voltPD2_off= []
 
-dataPD1, dataPD2, dataT = [], [], []
-voltPD1, voltPD2, voltT = [], [], []
+voltT = []
 
-for j, channel in enumerate([(chanPD1, dataPD1, voltPD1, sample_intervalPD1),
-                              (chanPD2, dataPD2, voltPD2, sample_intervalPD2),
-                              (chanT, dataT, voltT, sample_intervalT)]):
-    start = time.monotonic()
-    time_next_sample = start
+# Temp correectionn formula
+def tempCorrPD1(x):
+    return 1.4914 * math.exp(-0.016 * x)
 
-    # Read the same channel over and over
-    for i in range(SAMPLES):
-        # Wait for expected conversion finish time
-        while time.monotonic() < time_next_sample:
-            pass
+calibration_stable = False
+while not calibration_stable:
+    calibration_voltPD1 = []
+    calibration_voltPD2 = []
 
-        # Read conversion value for ADC channel
-        channel[1].append(channel[0].value)
-        channel[2].append(channel[0].voltage)
+    led_interval = 32
+    led_state = False
 
-        # Loop timing
-        time_last_sample = time_next_sample
-        time_next_sample += channel[3]
-        if time.monotonic() > (time_next_sample + channel[3]):
-            skips += 1
-            time_next_sample = time.monotonic() + channel[3]
+    for i in range(int(CALIBRATION_DURATION * RATE)):
+        if (i % led_interval) == 0:
+            led_state = not led_state
+            GPIO.output(18, GPIO.HIGH if led_state else GPIO.LOW)
+            time.sleep(sample_interval)
 
-        # Detect repeated values due to over polling
-        if i > 0 and channel[1][-1] == channel[1][-2]:
-            repeats += 1
+        if led_state:
+            if (i % led_interval) == 1:                time.sleep(sample_interval)
+            elif (i % led_interval) <= 15:
+                calibration_voltPD1.append(chanPD1.voltage)
+            elif (i % led_interval) <= 30:
+                calibration_voltPD2.append(chanPD2.voltage)
 
-    end = time.monotonic()
-    if j == 0:
-        time0 = end - start
-        print("    Reported        = {:5d}    sps for PD1".format(adsPD1.data_rate))
-        print("This took {0} seconds".format(time0))
-    if j == 1:
-        time1 = end - start
-        print("    Reported        = {:5d}    sps for PD2".format(adsPD2.data_rate))
-        print("This took {0} seconds".format(time1))
-    if j == 2:
-        time2 = end - start
-        print("    Reported        = {:5d}    sps for T".format(adsT.data_rate))
-        print("This took {0} seconds".format(time2))
+    calibration_mean_on = np.mean(calibration_voltPD1)
+    calibration_mean_off = np.mean(calibration_voltPD2)
+    calibration_result = calibration_mean_on - calibration_mean_off
 
-total_time = time0 + time1 + time2
 
-rate_reported = SAMPLES*3.0 / total_time
-rate_actual = (SAMPLES*3.0 - repeats) / total_time
+    calibration_stable = np.std(calibration_result) <= THRESHOLD
 
-print("SIU")
+    # Check stability # If not repeat, if yes then move on
+    if abs(calibration_result) <= THRESHOLD:
+        calibration_stable = True
 
-with open('output.txt', 'w') as file:
-    file.write("Took {:5.3f} s to acquire {:d} samples.\n".format(total_time, SAMPLES*3))
-    file.write("\n")
-    file.write("Configured:\n")
-    file.write("    Requested       = {:5d}    sps\n".format(RATE))
-    file.write("\n")
-    file.write("Actual:\n")
-    file.write("    Polling Rate    = {:8.2f} sps\n".format(rate_reported))
-    file.write("                      {:9.2%}\n".format(rate_reported / RATE))
-    file.write("    Skipped         = {:5d}\n".format(skips))
-    file.write("    Repeats         = {:5d}\n".format(repeats))
-    file.write("    Conversion Rate = {:8.2f} sps   (estimated)\n".format(rate_actual))
-    file.write("\n")
-    for i in range(len(voltPD1)):
-        file.write(str(voltPD1[i]) + ',' + str(voltPD2[i]) + ',' + str(voltT[i]) + '\n')
+for i in range(total_samples):
+    if (i % led_interval) == 0:
+        led_state = not led_state
+        GPIO.output(18, GPIO.HIGH if led_state else GPIO.LOW)
+        time.sleep(sample_interval)
+
+    if led_state: # LED on
+        if (i % led_interval) == 1:
+            time.sleep(sample_interval)
+        elif (i % led_interval) <= 15:
+            voltPD1_on.append(chanPD1.voltage - calibration_mean_on)
+        elif (i % led_interval) <= 30:
+            voltPD2_on.append(chanPD2.voltage - calibration_mean_off)
+
+        if (i % led_interval) == 30:
+            voltT.append(chanT.voltage)
+
+    else: # LED off
+        if (i % led_interval) >= 1 and (i % led_interval) <= 15:
+            voltPD1_off.append(chanPD1.voltage - calibration_mean_off)
+        elif (i % led_interval) >= 16 and (i % led_interval) <= 30:
+            voltPD2_off.append(chanPD2.voltage - calibration_mean_off)
+
+        if (i % led_interval) == 30:
+            voltT.append(chanT.voltage)
+
+# Substract dark current
+voltPD1_diff=np.mean(voltPD1_on)-np.mean(voltPD1_off)
+voltPD2_diff=np.mean(voltPD2_on)-np.mean(voltPD2_off)
+
+# Correction factor
+Temp_corr_factor=tempCorrPD1(voltT)
+
+# Correct for temperature changes for PD1
+voltPD1_temp=voltPD2_diff*Temp_corr_factor
+
+# Correct for temperature changes 
+# Since they have different sizes I couldn't find a way to save them in one
+np.savetxt('pd1_pd2_3000_real.xlsx', np.array([voltPD1_on, voltPD1_off,voltPD2_on, voltPD2_off]).T, delimiter='\t', fmt="%s")
+np.savetxt('temp_3000_real.xlsx', np.array([voltT]).T, delimiter='\t', fmt="%s")
+
+GPIO.output(18, GPIO.LOW)  # Turn off LED
+GPIO.cleanup()
